@@ -329,22 +329,30 @@ struct DetectionOut {
     source: String,
 }
 
+/// How much of the file's start detection looks at. Built-in signatures end by
+/// offset 262, but plugin and registry packs reach further: ISO 9660's volume
+/// descriptor sits at 0x8001 and El Torito's at 0x8801.
+const DETECT_HEAD_LEN: usize = 64 * 1024;
+
+/// Copy the start of the active file, releasing the lock before returning so
+/// callers can touch the plugins directory or the network without holding it.
+fn read_head(state: &State<AppState>) -> Result<Vec<u8>, String> {
+    let guard = state.open.lock().unwrap();
+    let file = guard.as_ref().ok_or("no file open")?;
+    let head_len = file.reader.len().min(DETECT_HEAD_LEN);
+    Ok(file
+        .reader
+        .read_bytes_at(0, head_len)
+        .map_err(|e| e.to_string())?
+        .to_vec())
+}
+
 /// Detect which known formats the active file's header matches (plan §13).
 /// Combines the built-in signature registry with enabled format plugins.
 /// Returns the candidates most-confident first, or an empty list if unknown.
 #[tauri::command]
 fn detect_format(app: AppHandle, state: State<AppState>) -> Result<Vec<DetectionOut>, String> {
-    // Read the head, then drop the lock before touching the plugins directory.
-    let head = {
-        let guard = state.open.lock().unwrap();
-        let file = guard.as_ref().ok_or("no file open")?;
-        // The deepest signature ends near offset 262; 512 bytes is a safe head.
-        let head_len = file.reader.len().min(512);
-        file.reader
-            .read_bytes_at(0, head_len)
-            .map_err(|e| e.to_string())?
-            .to_vec()
-    };
+    let head = read_head(&state)?;
 
     let mut out: Vec<DetectionOut> = format_detection::detect(&head)
         .into_iter()
@@ -1571,6 +1579,10 @@ struct RegistryFormat {
     detects: bool,
     #[serde(default)]
     confidence: u8,
+    /// The format's signature. Older indexes leave it out, so it defaults to
+    /// empty and the format is simply never suggested.
+    #[serde(default)]
+    detect: Vec<plugin_host::DetectPart>,
 }
 
 /// A pack listed in the registry's `index.json`.
@@ -1618,11 +1630,121 @@ fn http_get_text(url: &str) -> Result<String, String> {
 
 /// Fetch and parse the registry catalog (`index.json`).
 #[tauri::command]
-fn registry_catalog() -> Result<RegistryCatalog, String> {
+fn registry_catalog(app: AppHandle) -> Result<RegistryCatalog, String> {
+    fetch_catalog(&app)
+}
+
+/// Download `index.json`, parse it, and keep a copy on disk so a file opened
+/// later can be matched against the registry without going online.
+fn fetch_catalog(app: &AppHandle) -> Result<RegistryCatalog, String> {
     let url = format!("{REGISTRY_BASE}/index.json");
     let text = http_get_text(&url)?;
-    serde_json::from_str::<RegistryCatalog>(&text)
-        .map_err(|e| format!("registry index is malformed: {e}"))
+    let catalog = serde_json::from_str::<RegistryCatalog>(&text)
+        .map_err(|e| format!("registry index is malformed: {e}"))?;
+    // The cache is only a convenience; failing to write it is not an error.
+    if let Ok(path) = catalog_cache_path(app) {
+        let _ = std::fs::write(path, &text);
+    }
+    Ok(catalog)
+}
+
+/// Where the last downloaded registry index is kept (`<app-data>/registry-index.json`).
+fn catalog_cache_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let base = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
+    Ok(base.join("registry-index.json"))
+}
+
+/// A registry pack whose signature matches the open file.
+#[derive(Serialize, Debug, PartialEq)]
+struct RegistrySuggestion {
+    /// Pack id and repo-relative path, as `registry_install` takes it.
+    id: String,
+    path: String,
+    /// Pack name and description.
+    name: String,
+    description: String,
+    /// The matching format within the pack.
+    format: String,
+    extension: String,
+    confidence: u8,
+}
+
+/// The answer to "does the registry know this file?".
+#[derive(Serialize)]
+struct RegistrySuggestions {
+    /// False when no registry index has been downloaded yet, so nothing could
+    /// be checked. The UI then offers to check, rather than claiming no match.
+    checked: bool,
+    matches: Vec<RegistrySuggestion>,
+}
+
+/// Packs in `catalog` with a format whose signature matches `head`, skipping
+/// any already `installed`. One entry per pack (its best-matching format),
+/// most confident first, longer signatures winning a tie.
+fn registry_matches(
+    catalog: &RegistryCatalog,
+    head: &[u8],
+    installed: &HashSet<String>,
+) -> Vec<RegistrySuggestion> {
+    let mut hits: Vec<(usize, RegistrySuggestion)> = Vec::new();
+    for entry in catalog.formats.iter().filter(|e| !installed.contains(&e.id)) {
+        let best = entry
+            .formats
+            .iter()
+            .filter(|f| !f.detect.is_empty() && f.detect.iter().all(|p| p.matches(head)))
+            .map(|f| (f, f.detect.iter().map(|p| p.hex.len()).sum::<usize>()))
+            .max_by(|a, b| a.0.confidence.cmp(&b.0.confidence).then(a.1.cmp(&b.1)));
+        if let Some((f, specificity)) = best {
+            hits.push((
+                specificity,
+                RegistrySuggestion {
+                    id: entry.id.clone(),
+                    path: entry.path.clone(),
+                    name: entry.name.clone(),
+                    description: entry.description.clone(),
+                    format: f.name.clone(),
+                    extension: f.extension.clone(),
+                    confidence: f.confidence,
+                },
+            ));
+        }
+    }
+    hits.sort_by(|a, b| b.1.confidence.cmp(&a.1.confidence).then(b.0.cmp(&a.0)));
+    hits.into_iter().map(|(_, s)| s).collect()
+}
+
+/// Match the open file against every pack in the registry, so a format the
+/// app does not know yet can be installed from where it is needed. Offline by
+/// default: it reads the index saved by the last browse or check, and only
+/// downloads a fresh one when `refresh` is set (the user asked). Only the
+/// public index is downloaded; no byte of the file leaves the machine.
+#[tauri::command]
+fn registry_suggest(
+    app: AppHandle,
+    state: State<AppState>,
+    refresh: bool,
+) -> Result<RegistrySuggestions, String> {
+    let head = read_head(&state)?;
+    let catalog = if refresh {
+        fetch_catalog(&app)?
+    } else {
+        let cached = catalog_cache_path(&app)
+            .ok()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|t| serde_json::from_str::<RegistryCatalog>(&t).ok());
+        match cached {
+            Some(c) => c,
+            None => return Ok(RegistrySuggestions { checked: false, matches: Vec::new() }),
+        }
+    };
+    let installed: HashSet<String> = load_plugins(&app)
+        .map(|(plugins, _)| plugins.into_iter().map(|p| p.manifest.id).collect())
+        .unwrap_or_default();
+    Ok(RegistrySuggestions {
+        checked: true,
+        matches: registry_matches(&catalog, &head, &installed),
+    })
 }
 
 /// Download the plugin pack at `path` (from a catalog entry) and install it,
@@ -1708,6 +1830,7 @@ pub fn run() {
             plugin_set_enabled,
             registry_catalog,
             registry_install,
+            registry_suggest,
             license_status
         ])
         .run(tauri::generate_context!())
@@ -1776,5 +1899,80 @@ mod tests {
             "struct { this is not valid".into(),
         );
         assert!(err.is_err(), "a schema that doesn't parse must not export");
+    }
+
+    /// A cut-down registry index in the shape `tools/validate.py` writes.
+    const CATALOG: &str = r#"{
+      "version": 1, "count": 4,
+      "formats": [
+        { "id": "7z", "name": "7-Zip archive", "description": "7z header",
+          "path": "formats/7z/plugin.toml",
+          "formats": [ { "name": "7Z", "extension": "7z", "detects": true, "confidence": 100,
+                         "detect": [ { "offset": 0, "hex": "37 7A BC AF 27 1C" } ] } ] },
+        { "id": "iso9660", "name": "ISO 9660", "description": "CD image",
+          "path": "formats/iso9660/plugin.toml",
+          "formats": [
+            { "name": "ISO9660", "extension": "iso", "detects": true, "confidence": 95,
+              "detect": [ { "offset": 32769, "hex": "43 44 30 30 31" } ] },
+            { "name": "El Torito", "extension": "iso", "detects": true, "confidence": 95,
+              "detect": [ { "offset": 34817, "hex": "43 44 30 30 31" },
+                          { "offset": 34823, "hex": "45 4C 20 54 4F 52 49 54 4F" } ] } ] },
+        { "id": "loose-7z", "name": "Loose 7z", "description": "shorter magic",
+          "path": "formats/loose-7z/plugin.toml",
+          "formats": [ { "name": "7Z-ish", "extension": "7z", "detects": true, "confidence": 60,
+                         "detect": [ { "offset": 0, "hex": "37 7A" } ] } ] },
+        { "id": "old", "name": "From an older index", "description": "no detect field",
+          "path": "formats/old/plugin.toml",
+          "formats": [ { "name": "OLD", "extension": "old", "detects": true, "confidence": 100 } ] }
+      ]
+    }"#;
+
+    fn catalog() -> RegistryCatalog {
+        serde_json::from_str(CATALOG).expect("test catalog parses")
+    }
+
+    fn ids(found: &[RegistrySuggestion]) -> Vec<&str> {
+        found.iter().map(|s| s.id.as_str()).collect()
+    }
+
+    #[test]
+    fn registry_suggests_matching_packs_best_first() {
+        let head = [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C, 0x00, 0x04];
+        let found = registry_matches(&catalog(), &head, &HashSet::new());
+        assert_eq!(ids(&found), ["7z", "loose-7z"]);
+        assert_eq!(found[0].format, "7Z");
+        assert_eq!(found[0].path, "formats/7z/plugin.toml");
+    }
+
+    #[test]
+    fn registry_skips_installed_packs() {
+        let head = [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C];
+        let installed: HashSet<String> = ["7z".to_string()].into();
+        let found = registry_matches(&catalog(), &head, &installed);
+        assert_eq!(ids(&found), ["loose-7z"]);
+    }
+
+    #[test]
+    fn registry_matches_deep_signatures_once_per_pack() {
+        // An El Torito image also carries the plain ISO 9660 descriptor; the
+        // pack is offered once, under its more specific format.
+        let mut head = vec![0u8; 40 * 1024];
+        head[32769..32774].copy_from_slice(b"CD001");
+        head[34817..34822].copy_from_slice(b"CD001");
+        head[34823..34832].copy_from_slice(b"EL TORITO");
+        let found = registry_matches(&catalog(), &head, &HashSet::new());
+        assert_eq!(ids(&found), ["iso9660"]);
+        assert_eq!(found[0].format, "El Torito");
+        // The descriptor lies past what detection used to read (512 bytes).
+        assert!(head.len() <= DETECT_HEAD_LEN);
+    }
+
+    #[test]
+    fn registry_ignores_unknown_and_signatureless_formats() {
+        let found = registry_matches(&catalog(), b"just some text", &HashSet::new());
+        assert!(found.is_empty());
+        // A truncated file cannot match a signature that runs past its end.
+        let found = registry_matches(&catalog(), &[0x37, 0x7A, 0xBC], &HashSet::new());
+        assert_eq!(ids(&found), ["loose-7z"]);
     }
 }

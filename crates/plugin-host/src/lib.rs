@@ -149,7 +149,8 @@ impl FormatDef {
 }
 
 impl DetectPart {
-    fn matches(&self, head: &[u8]) -> bool {
+    /// True when these bytes sit at `offset` in `head`.
+    pub fn matches(&self, head: &[u8]) -> bool {
         let Ok(bytes) = parse_hex(&self.hex) else {
             return false;
         };

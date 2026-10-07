@@ -519,6 +519,33 @@ export function registryInstall(path: string): Promise<PluginInfo> {
   return invoke<PluginInfo>("registry_install", { path });
 }
 
+/** A registry pack whose signature matches the open file. Mirrors Rust `RegistrySuggestion`. */
+export interface RegistrySuggestion {
+  id: string;
+  /** Pass to `registryInstall`. */
+  path: string;
+  name: string;
+  description: string;
+  /** The matching format within the pack, as `builtinSchema` takes it once installed. */
+  format: string;
+  extension: string;
+  confidence: number;
+}
+
+/** Mirrors Rust `RegistrySuggestions`. */
+export interface RegistrySuggestions {
+  /** False when no registry index has been downloaded yet, so nothing was checked. */
+  checked: boolean;
+  matches: RegistrySuggestion[];
+}
+
+/** Match the open file against every registry pack not yet installed. Offline
+ *  unless `refresh`: it uses the index saved by the last browse or check. Only
+ *  the public index is ever downloaded; the file's bytes stay local. */
+export function registrySuggest(refresh: boolean): Promise<RegistrySuggestions> {
+  return invoke<RegistrySuggestions>("registry_suggest", { refresh });
+}
+
 // --- Compare against another file ------------------------------------------
 
 /** Summary of an active comparison. Mirrors the Rust `CompareStatus`. */

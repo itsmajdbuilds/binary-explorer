@@ -33,6 +33,8 @@ import {
   compareSeek,
   compareParse,
   fixChecksums,
+  registryInstall,
+  registrySuggest,
   type CompareStatus,
   type Coverage,
   type SchemaEntry,
@@ -48,6 +50,8 @@ import {
   type StringHit,
   type Guess,
   type StructureHints,
+  type RegistrySuggestions,
+  type RegistrySuggestion,
 } from "./api";
 import { HexView } from "./HexView";
 import { FieldBuilder, PREVIEW_CAP } from "./FieldBuilder";
@@ -88,6 +92,10 @@ export function App() {
   const [gotoText, setGotoText] = useState("");
   const [formats, setFormats] = useState<Detection[]>([]);
   const [builtin, setBuiltin] = useState<BuiltinSchema | null>(null);
+  /** Registry packs that would read the open file, offered when no installed
+   *  schema can. Null hides the bar (a schema is available, or it was dismissed). */
+  const [suggest, setSuggest] = useState<RegistrySuggestions | null>(null);
+  const [suggestBusy, setSuggestBusy] = useState(false);
   const [entropyData, setEntropyData] = useState<number[]>([]);
   const [viewMode, setViewMode] = useState<"hex" | "text">("hex");
   const [strings, setStrings] = useState<StringHit[]>([]);
@@ -294,14 +302,66 @@ export function App() {
       setMatchIndex(0);
       setEdit(null);
       setEditVersion((v) => v + 1);
-      const detected = await detectFormat();
-      setFormats(detected);
-      setBuiltin(detected.length > 0 ? await builtinSchema(detected[0].format) : null);
+      await detectAndSuggest();
       setStrings(await findStrings(4));
       setEntropyData(await entropy(256));
       setShape(null);
     } catch (e) {
       setError(String(e));
+    }
+  }
+
+  // Recognise the open file. When nothing installed has a schema for it, look
+  // for a registry pack that does — offline, against the last saved index.
+  async function detectAndSuggest() {
+    const detected = await detectFormat();
+    setFormats(detected);
+    const schema = detected.length > 0 ? await builtinSchema(detected[0].format) : null;
+    setBuiltin(schema);
+    if (schema) {
+      setSuggest(null);
+      return;
+    }
+    try {
+      // A miss against the saved index stays quiet; "no match" is only said
+      // after the user asks for a fresh check.
+      const found = await registrySuggest(false);
+      setSuggest(found.checked && found.matches.length === 0 ? null : found);
+    } catch {
+      setSuggest(null);
+    }
+  }
+
+  // The user asked: download the current registry index and match again.
+  async function handleCheckRegistry() {
+    setSuggestBusy(true);
+    try {
+      setSuggest(await registrySuggest(true));
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSuggestBusy(false);
+    }
+  }
+
+  // Install the suggested pack, then load its schema straight onto the file.
+  async function handleInstallSuggested(s: RegistrySuggestion) {
+    setSuggestBusy(true);
+    try {
+      await registryInstall(s.path);
+      await handlePluginsChanged();
+      const schema = await builtinSchema(s.format);
+      if (schema) {
+        setSchemaText(schema.text);
+        setEntry(schema.entry);
+        setEndian(schema.endian);
+        await runParse(schema.text, schema.entry, schema.endian);
+      }
+      setSuggest(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSuggestBusy(false);
     }
   }
 
@@ -315,9 +375,7 @@ export function App() {
     }
     if (file) {
       try {
-        const detected = await detectFormat();
-        setFormats(detected);
-        setBuiltin(detected.length > 0 ? await builtinSchema(detected[0].format) : null);
+        await detectAndSuggest();
       } catch (e) {
         setError(String(e));
       }
@@ -975,6 +1033,54 @@ export function App() {
             )}
             <div className="spacer" />
             <button className="ghost" onClick={handleCompareClose} title="Stop comparing">Close</button>
+          </div>
+        )}
+        {suggest && !builtin && (
+          <div className="suggest-bar">
+            <span className="sug-label">registry</span>
+            {suggest.matches.length > 0 ? (
+              <>
+                <span className="sug-text">
+                  Looks like <b>{suggest.matches[0].name}</b>
+                  <span className="sug-format"> · {suggest.matches[0].format}</span>
+                </span>
+                <button
+                  className="builtin-btn"
+                  disabled={suggestBusy}
+                  onClick={() => handleInstallSuggested(suggest.matches[0])}
+                  title={suggest.matches[0].description}
+                >
+                  {suggestBusy ? "Installing…" : "Install & use"}
+                </button>
+                {suggest.matches.slice(1, 4).map((m) => (
+                  <button
+                    key={m.id}
+                    className="ghost"
+                    disabled={suggestBusy}
+                    onClick={() => handleInstallSuggested(m)}
+                    title={`${m.description} — install ${m.name}`}
+                  >
+                    or {m.name}
+                  </button>
+                ))}
+              </>
+            ) : suggest.checked ? (
+              <span className="sug-text dim">No registry pack recognises this file.</span>
+            ) : (
+              <>
+                <span className="sug-text">No installed schema reads this file.</span>
+                <button
+                  className="ghost"
+                  disabled={suggestBusy}
+                  onClick={handleCheckRegistry}
+                  title="Downloads the public list of registry formats and matches it here. Nothing from this file is sent."
+                >
+                  {suggestBusy ? "Checking…" : "Check the registry"}
+                </button>
+              </>
+            )}
+            <div className="spacer" />
+            <button className="ghost" onClick={() => setSuggest(null)} title="Hide until the next file">Dismiss</button>
           </div>
         )}
         <FileMap

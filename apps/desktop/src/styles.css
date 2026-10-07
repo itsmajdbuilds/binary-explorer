@@ -118,6 +118,22 @@ button.ghost:hover { border-color: var(--accent); color: var(--text); filter: no
 button.ghost.on { border-color: var(--pink); color: var(--pink); }
 .status-diff { color: var(--pink); }
 
+/* Suggest bar — a registry pack can read a file nothing installed can. Teal,
+   the app's accent, since it leads straight to "Use <format>". */
+.suggest-bar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 5px 12px; font-size: 12px;
+  background: color-mix(in srgb, var(--accent) 8%, var(--bg-alt));
+  border-bottom: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+}
+.suggest-bar .spacer { flex: 1; }
+.suggest-bar button { padding: 1px 8px; }
+.sug-label { color: var(--accent); font-weight: 600; font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; }
+.sug-text { color: var(--text-dim); }
+.sug-text b { color: var(--text); font-weight: 600; }
+.sug-text.dim { color: var(--muted); }
+.sug-format { font-family: var(--mono); color: var(--muted); }
+
 .empty-state { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; color: var(--muted); }
 .empty-state h1 { color: var(--accent); margin: 0; font-weight: 700; font-size: 34px; }
 
