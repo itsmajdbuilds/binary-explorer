@@ -1558,7 +1558,7 @@ fn plugin_set_enabled(app: AppHandle, id: String, enabled: bool) -> Result<(), S
 // file is ever uploaded (browsing/installing is download-only).
 
 /// Base URL of the format registry (raw files on the `main` branch).
-const REGISTRY_BASE: &str = "https://raw.githubusercontent.com/Axy0m/nybble-registry/main";
+const REGISTRY_BASE: &str = "https://raw.githubusercontent.com/itsmajdbuilds/binary-explorer-registry/main";
 
 /// One format contributed by a registry entry (mirrors the registry index).
 #[derive(Serialize, Deserialize)]

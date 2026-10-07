@@ -249,7 +249,7 @@ cargo run -p nybble-cli -- parse <schema> <file>   # without installing
 ## Install
 
 Download the installer for your platform from the
-[latest release](https://github.com/Axy0m/binary-explorer/releases/latest):
+[latest release](https://github.com/itsmajdbuilds/binary-explorer/releases/latest):
 
 | Platform | File |
 |---|---|
